@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registro de Abastecimento</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Biblioteca SheetJS para exportação em formato XLSX -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script> 
+    
+    <script>
+        // Configurações Tailwind baseadas no seu projeto de referência (KMS)
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'cianoblue': {
+                            50: '#F0F9FF',
+                            100: '#E0F2FE',
+                            200: '#BAE6FD',
+                            600: '#06B6D4', // Ciano Primário - Clean & Modern
+                            700: '#0891B2', // Ciano Hover
+                        },
+                        'teal': {
+                            600: '#0D9488', // Verde (para sucesso/salvamento)
+                            700: '#0F766E', 
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'], // Mantendo Inter para consistência
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- O script principal é do tipo "module" para permitir o uso de "import" -->
+    <script type="module">
+        // ----------------------------------------------------------------------
+        // REFERÊNCIAS FIREBASE SDK 
+        // ----------------------------------------------------------------------
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // ----------------------------------------------------------------------
+        // CONFIGURAÇÃO DO FIREBASE DE FALLBACK
+        // ----------------------------------------------------------------------
+        const FALLBACK_FIREBASE_CONFIG = {
+             // Configuração de fallback caso o ambiente não injete a variável
+             apiKey: "AIzaSyBvbLbyI4ho-X9buW5j6atXvehnoZM0qXM",
+             authDomain: "gestao-abastecimento.firebaseapp.com",
+             projectId: "gestao-abastecimento",
+             storageBucket: "gestao-abastecimento.firebasestorage.app",
+             messagingSenderId: "462798250454",
+             appId: "1:462798250454:web:f56cf50bd2c0223459c477"
+        };
+
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false; 
+        let suppliesData = [];
+        const PRICE_PER_LITER = 6.15; 
+
+        // VARIÁVEL GLOBAL PARA ARMAZENAR A ASSINATURA CAPTURADA
+        let currentSignatureBase64 = null; 
+        let canvasContext = null; 
+
+        // --- Funções de UI e Mensagens ---
+
+        function displayMessage(message, type = 'info') {
+            const container = document.getElementById('message-container');
+            const color = type === 'success' ? 'bg-teal-600' : type === 'error' ? 'bg-red-500' : 'bg-blue-500';
+            const icon = type === 'success' ? 'fa-check-circle' : type === 'error' ? 'fa-exclamation-triangle' : 'fa-info-circle';
+
+            const html = `
+                <div class="fixed top-4 right-4 z-50 p-4 rounded-lg text-white shadow-lg ${color} flex items-center" style="min-width: 250px;">
+                    <i class="fas ${icon} mr-2"></i>
+                    <span>${message}</span>
+                </div>
+            `;
+            container.innerHTML = html;
+            setTimeout(() => container.innerHTML = '', 5000);
+        }
+
+        function showView(viewId) {
+            document.getElementById('register-view').classList.add('hidden');
+            document.getElementById('admin-view').classList.add('hidden');
+            document.getElementById(viewId).classList.remove('hidden');
+
+            // Chamada crucial para corrigir o canvas quando a view de registro é aberta
+            if (viewId === 'register-view') {
+                 // Pequeno delay para garantir que o layout foi aplicado
+                 setTimeout(resizeCanvas, 50); 
+            }
+
+            const regBtn = document.getElementById('show-register-btn');
+            const admBtn = document.getElementById('show-admin-btn');
+            
+            [regBtn, admBtn].forEach(btn => {
+                btn.classList.remove('bg-cianoblue-700', 'text-white');
+                btn.classList.add('text-cianoblue-600', 'bg-cianoblue-50');
+            });
+
+            if (viewId === 'register-view') {
+                regBtn.classList.add('bg-cianoblue-700', 'text-white');
+                regBtn.classList.remove('text-cianoblue-600', 'bg-cianoblue-50');
+            } else if (viewId === 'admin-view') {
+                admBtn.classList.add('bg-cianoblue-700', 'text-white');
+                admBtn.classList.remove('text-cianoblue-600', 'bg-cianoblue-50');
+            }
+        }
+
+        window.showRegisterView = () => showView('register-view');
+        window.showAdminView = () => showView('admin-view');
+
+        // --- Inicialização do Firebase ---
+        async function initFirebase() {
+            setLogLevel('Debug'); 
+            console.log("Iniciando Firebase...");
+
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+            let firebaseConfig = FALLBACK_FIREBASE_CONFIG; 
+            
+            if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                try {
+                    firebaseConfig = JSON.parse(__firebase_config);
+                } catch (e) {
+                    console.error("ERRO: Falha ao parsear __firebase_config. Usando configuração fixa.", e);
+                }
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                console.log("Firebase App e Services inicializados com sucesso.");
+
+                return new Promise((resolve) => {
+                    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+                        unsubscribe(); 
+                        
+                        if (user) {
+                            userId = user.uid;
+                        } else {
+                            try {
+                                if (initialAuthToken) {
+                                    await signInWithCustomToken(auth, initialAuthToken);
+                                } else {
+                                    await signInAnonymously(auth);
+                                }
+                                userId = auth.currentUser?.uid || crypto.randomUUID(); 
+                            } catch (error) {
+                                console.error("ERRO CRÍTICO DE AUTENTICAÇÃO:", error);
+                                displayMessage("Falha crítica na autenticação. Dados não serão salvos/carregados.", 'error');
+                                userId = null;
+                            }
+                        }
+                        
+                        isAuthReady = true;
+                        if (userId) {
+                            console.log("Autenticação resolvida. UID:", userId);
+                            document.getElementById('debug-auth-id').textContent = userId; // Exibe o UID para depuração/referência
+                            setupDataListeners(appId);
+                        } else {
+                            document.getElementById('admin-table-body').innerHTML = '<tr><td colspan="8" class="p-4 text-center text-red-600 font-bold bg-red-50">ERRO: Autenticação falhou. Verifique as Regras.</td></tr>';
+                        }
+                        resolve(true);
+                    });
+                });
+
+            } catch (e) {
+                console.error("Erro FATAL ao inicializar o Firebase:", e);
+                displayMessage(`Erro FATAL: Falha ao iniciar o Firebase. ${e.message}`, 'error');
+                isAuthReady = false;
+                return Promise.resolve(false);
+            }
+        }
+        
+        // --- Lógica do Formulário e Cálculos ---
+
+        function getDayOfWeek(dateString) {
+            const date = new Date(dateString + 'T00:00:00'); 
+            if (isNaN(date)) return '';
+            const options = { weekday: 'long' };
+            const day = date.toLocaleDateString('pt-BR', options);
+            return day.charAt(0).toUpperCase() + day.slice(1);
+        }
+
+        function updateTotalValue() {
+            const litersInput = document.getElementById('liters');
+            const totalValueSpan = document.getElementById('total-value');
+            const dayOfWeekInput = document.getElementById('day-of-week');
+            const dateInput = document.getElementById('date');
+
+            const liters = parseFloat(litersInput.value) || 0;
+            const total = liters * PRICE_PER_LITER;
+
+            totalValueSpan.textContent = `R$ ${total.toFixed(2).replace('.', ',')}`;
+            
+            if (dateInput.value) {
+                dayOfWeekInput.value = getDayOfWeek(dateInput.value); 
+            } else {
+                dayOfWeekInput.value = '';
+            }
+        }
+
+        // --- Lógica de Assinatura (Canvas no Modal) ---
+        const SIGNATURE_CANVAS_ID = 'signature-canvas';
+        let isDrawing = false;
+        let lastX = 0;
+        let lastY = 0;
+
+        // Função crucial de redimensionamento e reinicialização
+        function resizeCanvas() {
+            const canvas = document.getElementById(SIGNATURE_CANVAS_ID);
+            if (!canvas) return;
+
+            const rect = canvas.parentNode.getBoundingClientRect();
+            
+            if (rect.width > 0) {
+                // Guarda o estado atual da assinatura (se houver)
+                const existingDataUrl = canvasContext && canvas.width > 0 ? canvas.toDataURL() : null;
+                
+                // Redefine as dimensões do canvas principal
+                canvas.width = rect.width;
+                canvas.height = 192; // Altura fixa de 48 * 4 Tailwind units
+                
+                const ctx = canvas.getContext('2d');
+                canvasContext = ctx; // Armazena o contexto
+
+                // Restaura o conteúdo se existir
+                if (existingDataUrl) {
+                    const img = new Image();
+                    img.onload = () => {
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                        // Garante que os estilos de desenho estejam corretos após o redimensionamento
+                        ctx.lineWidth = 2;
+                        ctx.strokeStyle = '#000000';
+                        ctx.lineCap = 'round';
+                        ctx.lineJoin = 'round';
+                    };
+                    img.src = existingDataUrl;
+                } else {
+                    // Limpa e desenha a linha de base
+                    clearCanvasVisual(true); 
+                }
+                
+                // Garante que os estilos de desenho estejam corretos para futuros traços
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = '#000000';
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+            } else {
+                 console.log("DEBUG: Canvas width is 0. Cannot resize/initialize yet.");
+            }
+        }
+
+        function setupSignatureCanvas() {
+            const canvas = document.getElementById(SIGNATURE_CANVAS_ID);
+            if (!canvas) return;
+            
+            // Adiciona listener de redimensionamento da janela
+            window.addEventListener('resize', resizeCanvas);
+
+            const ctx = canvas.getContext('2d');
+            canvasContext = ctx;
+
+            const getCoords = (e) => {
+                const rect = canvas.getBoundingClientRect();
+                let clientX, clientY;
+                if (e.touches) { 
+                    e.preventDefault();
+                    clientX = e.touches[0].clientX;
+                    clientY = e.touches[0].clientY;
+                } else { 
+                    clientX = e.clientX;
+                    clientY = e.clientY;
+                }
+                return { x: clientX - rect.left, y: clientY - rect.top };
+            };
+
+            const draw = (e) => {
+                if (!isDrawing) return;
+                const { x: currentX, y: currentY } = getCoords(e);
+                ctx.beginPath();
+                ctx.moveTo(lastX, lastY);
+                ctx.lineTo(currentX, currentY);
+                ctx.stroke();
+                [lastX, lastY] = [currentX, currentY];
+            };
+
+            const startDrawing = (e) => {
+                isDrawing = true;
+                const { x, y } = getCoords(e);
+                [lastX, lastY] = [x, y];
+            };
+
+            const stopDrawing = () => {
+                isDrawing = false;
+            };
+
+            // Eventos de Mouse
+            canvas.addEventListener('mousedown', startDrawing);
+            canvas.addEventListener('mousemove', draw);
+            canvas.addEventListener('mouseup', stopDrawing);
+            canvas.addEventListener('mouseout', stopDrawing);
+
+            // Eventos de Toque
+            canvas.addEventListener('touchstart', startDrawing);
+            canvas.addEventListener('touchmove', draw);
+            canvas.addEventListener('touchend', stopDrawing);
+
+            // Setup listeners para os botões do modal
+            document.getElementById('clear-signature-btn').addEventListener('click', () => {
+                 clearCanvasVisual(true);
+            });
+            document.getElementById('save-signature-btn').addEventListener('click', saveSignature);
+
+            // Inicialização visual após o DOM carregar
+            resizeCanvas(); 
+        }
+
+        // Limpa visualmente o canvas e redesenha a linha de base
+        function clearCanvasVisual(shouldRedrawLine) {
+            const canvas = document.getElementById(SIGNATURE_CANVAS_ID);
+            const ctx = canvasContext || canvas.getContext('2d');
+            if (canvas && ctx) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                if (shouldRedrawLine) {
+                    ctx.beginPath();
+                    ctx.strokeStyle = '#D1D5DB'; 
+                    ctx.moveTo(0, canvas.height - 1);
+                    ctx.lineTo(canvas.width, canvas.height - 1);
+                    ctx.stroke();
+                }
+            }
+        }
+        
+        // Limpa o canvas E reseta o estado da assinatura global
+        window.clearSignatureState = function(updatePreview = true) {
+            clearCanvasVisual(true);
+            currentSignatureBase64 = null;
+            if (updatePreview) {
+                document.getElementById('signature-preview').style.display = 'none';
+                document.getElementById('signature-preview').src = '';
+                document.getElementById('signature-status').textContent = 'Nenhuma assinatura capturada.';
+                document.getElementById('signature-status').classList.remove('text-teal-600');
+                document.getElementById('signature-status').classList.add('text-red-500');
+            }
+        }
+
+        // Função para capturar o Base64 do canvas
+        function captureSignatureBase64FromCanvas() {
+            const canvas = document.getElementById(SIGNATURE_CANVAS_ID);
+            if (!canvas || canvas.width === 0 || canvas.height === 0) {
+                 return null;
+            }
+            const ctx = canvasContext || canvas.getContext('2d');
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+            let hasPixels = false;
+            // Verifica se há pixels desenhados (ignorando a linha de base)
+            for (let i = 3; i < imageData.length; i += 4) { 
+                if (imageData[i] > 100) { // Verifica canal alfa com boa margem
+                    hasPixels = true;
+                    break;
+                }
+            }
+            // Só retorna Base64 se houver pixels desenhados
+            return hasPixels ? canvas.toDataURL('image/png') : null;
+        }
+
+        // Captura o Base64 da variável global (a ser usado no handleSaveSupply)
+        function getSignatureBase64() {
+            return currentSignatureBase64;
+        }
+        
+        // Funções do Modal de Assinatura
+        window.openSignatureModal = function() {
+            // Abre o modal
+            document.getElementById('signature-modal').classList.remove('hidden');
+            // Garante que o canvas esteja dimensionado e limpo/restaurado
+            setTimeout(() => {
+                resizeCanvas();
+                if (currentSignatureBase64) {
+                    // Restaura a assinatura salva no canvas do modal para edição/visualização
+                    const img = new Image();
+                    img.onload = () => {
+                         clearCanvasVisual(false); // Limpa sem linha de base
+                         canvasContext.drawImage(img, 0, 0, document.getElementById(SIGNATURE_CANVAS_ID).width, document.getElementById(SIGNATURE_CANVAS_ID).height);
+                    };
+                    img.src = currentSignatureBase64;
+                } else {
+                     clearCanvasVisual(true); // Se não há assinatura, desenha a linha de base
+                }
+            }, 50);
+        }
+
+        window.closeSignatureModal = function() {
+            document.getElementById('signature-modal').classList.add('hidden');
+        }
+        
+        // Salva a assinatura do canvas para a variável global e fecha o modal
+        function saveSignature() {
+            const base64 = captureSignatureBase64FromCanvas(); 
+            
+            if (base64) {
+                currentSignatureBase64 = base64;
+                
+                // Atualiza a prévia no formulário principal
+                document.getElementById('signature-preview').src = base64;
+                document.getElementById('signature-preview').style.display = 'block';
+                document.getElementById('signature-status').textContent = 'Assinatura capturada.';
+                document.getElementById('signature-status').classList.remove('text-red-500');
+                document.getElementById('signature-status').classList.add('text-teal-600');
+                
+                closeSignatureModal();
+                displayMessage('Assinatura salva com sucesso!', 'success');
+            } else {
+                 displayMessage('Por favor, assine no campo antes de salvar.', 'error');
+            }
+        }
+
+
+        // --- Lógica de Salvamento e Modal de Confirmação ---
+
+        window.handleSaveSupply = function(event) {
+            event.preventDefault();
+
+            const form = document.getElementById('supply-form');
+            const liters = parseFloat(document.getElementById('liters').value);
+            const mileage = parseFloat(document.getElementById('mileage').value);
+            
+            const signatureBase64 = getSignatureBase64(); 
+
+            // VERIFICAÇÃO 1: Autenticação
+            if (!isAuthReady || !userId) {
+                displayMessage("Sistema em inicialização ou falha de autenticação. Tente novamente em instantes.", 'error');
+                console.error("ERRO: Tentativa de salvar antes da autenticação ser resolvida.");
+                return;
+            }
+
+            // VERIFICAÇÃO 2: Validação do Formulário
+            if (!form.checkValidity() || isNaN(liters) || liters <= 0 || isNaN(mileage) || mileage <= 0) {
+                displayMessage('Por favor, preencha todos os campos corretamente. KM e Litros devem ser maiores que 0.', 'error');
+                return;
+            }
+
+            // VERIFICAÇÃO 3: Assinatura
+            if (!signatureBase64) {
+                 displayMessage('A assinatura do Motorista é obrigatória. Por favor, abra o pop-up e assine.', 'error');
+                 return;
+            }
+
+            const totalValue = liters * PRICE_PER_LITER;
+            
+            const record = {
+                date: document.getElementById('date').value,
+                dayOfWeek: document.getElementById('day-of-week').value,
+                plate: document.getElementById('plate').value.toUpperCase(),
+                mileage: mileage,
+                driver: document.getElementById('driver').value,
+                attendant: document.getElementById('attendant').value,
+                liters: liters,
+                pricePerLiter: PRICE_PER_LITER,
+                totalValue: totalValue,
+                signatureBase64: signatureBase64,
+                timestamp: new Date().toISOString(),
+                userId: userId, 
+            };
+            
+            showReceiptModal(record);
+        }
+        
+        async function saveSupplyToFirestore(record) {
+             if (!isAuthReady || !userId || !db) {
+                displayMessage("ERRO: Sistema não autenticado. O salvamento falhou.", 'error');
+                return;
+            }
+
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const collectionPath = `artifacts/${appId}/public/data/supplies`;
+            
+            try {
+                const saveBtn = document.getElementById('confirm-save-btn');
+                saveBtn.disabled = true;
+                saveBtn.textContent = 'Salvando...';
+
+                await addDoc(collection(db, collectionPath), record);
+
+                displayMessage('Abastecimento registrado com sucesso!', 'success');
+                
+                document.getElementById('supply-form').reset();
+                window.clearSignatureState(true); // Limpa o estado da assinatura global e a prévia
+                updateTotalValue();
+                closeReceiptModal();
+
+            } catch (e) {
+                console.error("ERRO CRÍTICO AO SALVAR (Firestore): ", e);
+                if (e.code === 'permission-denied') {
+                    displayMessage('ERRO CRÍTICO (403): Permissão Negada. **Verifique as Regras de Segurança no Firebase!**', 'error');
+                } else {
+                     displayMessage(`Erro ao salvar: ${e.message}.`, 'error');
+                }
+            } finally {
+                const saveBtn = document.getElementById('confirm-save-btn');
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Salvar no Administrativo';
+            }
+        }
+
+
+        function showReceiptModal(record) {
+            const modal = document.getElementById('receipt-modal');
+            const receiptContent = document.getElementById('receipt-content');
+            
+            const totalFormatted = record.totalValue.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+            const litersFormatted = record.liters.toFixed(2).replace('.', ',');
+            const priceFormatted = record.pricePerLiter.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+
+            receiptContent.innerHTML = `
+                <div class="p-6 bg-white border border-gray-300 rounded-lg shadow-xl w-full max-w-sm mx-auto">
+                    <h2 class="text-xl font-bold text-center text-gray-800 mb-4 border-b pb-2">NOTA DE ABASTECIMENTO</h2>
+                    <div class="space-y-2 text-sm">
+                        <p><strong>Data:</strong> ${record.date} (${record.dayOfWeek})</p>
+                        <p><strong>Placa:</strong> ${record.plate}</p>
+                        <p><strong>KM:</strong> ${record.mileage.toLocaleString('pt-BR')} km</p>
+                        <p><strong>Motorista:</strong> ${record.driver}</p>
+                        <p><strong>Responsável Ab.:</strong> ${record.attendant}</p>
+                        <div class="border-t pt-2 mt-2">
+                            <p><strong>Litros Abastecidos:</strong> <span class="font-semibold">${litersFormatted} L</span></p>
+                            <p><strong>Preço/Litro:</strong> ${priceFormatted}</p>
+                        </div>
+                    </div>
+                    <div class="text-2xl font-extrabold text-cianoblue-600 mt-4 pt-4 border-t-2 border-dashed border-gray-300 flex justify-between items-center">
+                        <span>TOTAL:</span>
+                        <span>${totalFormatted}</span>
+                    </div>
+
+                    <div class="mt-6 text-center pt-4 border-t">
+                        <p class="text-xs text-gray-500 mb-2">Assinatura do Motorista/Proprietário:</p>
+                        ${record.signatureBase64 ? `<img src="${record.signatureBase64}" alt="Assinatura" class="w-full h-auto border border-gray-400 rounded-md bg-white"/>` : '<p class="text-red-500">Assinatura não capturada.</p>'}
+                    </div>
+                </div>
+            `;
+            
+            // Clonar e substituir o botão para remover listeners antigos e evitar duplicação de salvamento
+            const saveBtn = document.getElementById('confirm-save-btn');
+            const newSaveBtn = saveBtn.cloneNode(true);
+            saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+
+            newSaveBtn.onclick = async () => {
+                await saveSupplyToFirestore(record);
+            };
+
+            modal.classList.remove('hidden');
+        }
+
+        window.closeReceiptModal = function() {
+            document.getElementById('receipt-modal').classList.add('hidden');
+        }
+
+
+        // --- Lógica Administrativa (Admin) ---
+
+        function setupDataListeners(appId) {
+            if (!db || !userId) {
+                return;
+            }
+
+            const collectionPath = `artifacts/${appId}/public/data/supplies`;
+            const collectionRef = collection(db, collectionPath);
+            const q = query(collectionRef);
+
+            onSnapshot(q, (snapshot) => {
+                suppliesData = [];
+                snapshot.forEach((doc) => {
+                    suppliesData.push({ id: doc.id, ...doc.data() });
+                });
+                
+                suppliesData.sort((a, b) => {
+                    const dateA = new Date(a.timestamp || a.date);
+                    const dateB = new Date(b.timestamp || b.date);
+                    return dateB - dateA;
+                });
+                
+                renderAdminTable(suppliesData);
+                document.getElementById('total-records-count').textContent = suppliesData.length;
+            }, (error) => {
+                console.error("Erro ao ouvir dados do Firestore:", error);
+                const tableBody = document.getElementById('admin-table-body');
+                if (error.code === 'permission-denied') {
+                    displayMessage("Erro de Permissão (403): Falha ao carregar dados. Verifique as Regras de Segurança.", 'error');
+                    tableBody.innerHTML = '<tr><td colspan="8" class="p-4 text-center text-red-600 font-bold bg-red-50">ERRO: Permissão Negada. Verifique as Regras de Segurança!</td></tr>';
+                } else {
+                    displayMessage("Erro ao carregar dados administrativos.", 'error');
+                     tableBody.innerHTML = '<tr><td colspan="8" class="p-4 text-center text-red-600 font-bold bg-red-50">ERRO: Falha ao carregar dados.</td></tr>';
+                }
+            });
+        }
+
+        // Funções do Modal de Visualização da Assinatura Admin
+        window.openSignatureDisplayModal = function(base64) {
+            document.getElementById('display-signature-image').src = base64;
+            document.getElementById('signature-display-modal').classList.remove('hidden');
+        }
+        window.closeSignatureDisplayModal = function() {
+            document.getElementById('signature-display-modal').classList.add('hidden');
+        }
+
+        function renderAdminTable(data) {
+            const tbody = document.getElementById('admin-table-body');
+            tbody.innerHTML = '';
+
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="p-4 text-center text-gray-500">Nenhum registro de abastecimento encontrado.</td></tr>';
+                return;
+            }
+
+            data.forEach(record => {
+                const totalFormatted = record.totalValue.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+                const litersFormatted = record.liters.toFixed(2).replace('.', ',');
+                
+                const signatureHtml = record.signatureBase64 
+                    ? `<button onclick="openSignatureDisplayModal('${record.signatureBase64}')" class="text-cianoblue-600 hover:text-cianoblue-800 text-sm font-semibold transition"><i class="fas fa-file-image mr-1"></i> Visualizar</button>` 
+                    : `<span class="text-red-400 text-xs">Ausente</span>`;
+
+                const row = `
+                    <tr class="border-b hover:bg-cianoblue-50 transition duration-150">
+                        <td class="p-3 whitespace-nowrap text-sm text-gray-700">${record.date}</td>
+                        <td class="p-3 whitespace-nowrap text-sm text-gray-700 font-medium">${record.plate}</td>
+                        <td class="p-3 whitespace-nowrap text-sm text-gray-700">${record.mileage.toLocaleString('pt-BR')}</td>
+                        <td class="p-3 text-sm text-gray-700">${record.driver}</td>
+                        <td class="p-3 text-sm text-gray-700">${record.attendant}</td>
+                        <td class="p-3 whitespace-nowrap text-sm text-teal-600">${litersFormatted} L</td>
+                        <td class="p-3 whitespace-nowrap text-sm font-semibold text-cianoblue-600">${totalFormatted}</td>
+                        <td class="p-3 text-center">${signatureHtml}</td> <!-- Coluna da Assinatura -->
+                    </tr>
+                `;
+                tbody.innerHTML += row;
+            });
+        }
+
+        // NOVO: Função para exportar os dados para XLSX (Excel)
+        window.exportToXLSX = function() {
+            if (suppliesData.length === 0) {
+                displayMessage('Não há dados para exportar.', 'error');
+                return;
+            }
+
+            // 1. Mapeia os dados para um formato JSON mais amigável para a planilha
+            const dataToExport = suppliesData.map(record => ({
+                'ID': record.id,
+                'Data': record.date,
+                'Dia_Semana': record.dayOfWeek,
+                'Placa': record.plate,
+                'KM': record.mileage,
+                'Motorista': record.driver,
+                'Responsavel_Abastecimento': record.attendant,
+                'Litros': record.liters,
+                'Valor_Litro': record.pricePerLiter,
+                'Valor_Total': record.totalValue,
+                // Mantemos o Base64 aqui. No Excel, será uma célula de texto longa.
+                'Assinatura_Base64': record.signatureBase64 || 'Ausente', 
+                'ID_Usuario': record.userId,
+                'Timestamp': record.timestamp,
+            }));
+
+            // 2. Cria a planilha (Worksheet) a partir do JSON
+            const ws = XLSX.utils.json_to_sheet(dataToExport);
+
+            // Opcional: Ajusta a largura das colunas (Ex: Coluna B 'Placa' com 10, Coluna K 'Assinatura' com 50)
+            const wscols = [
+                { wch: 25 }, // ID
+                { wch: 12 }, // Data
+                { wch: 15 }, // Dia_Semana
+                { wch: 10 }, // Placa
+                { wch: 8 },  // KM
+                { wch: 25 }, // Motorista
+                { wch: 25 }, // Responsavel_Abastecimento
+                { wch: 10 }, // Litros
+                { wch: 10 }, // Valor_Litro
+                { wch: 12 }, // Valor_Total
+                { wch: 100 }, // Assinatura_Base64 (Aumentado para caber o texto)
+                { wch: 25 }, // ID_Usuario
+                { wch: 20 }, // Timestamp
+            ];
+            ws['!cols'] = wscols;
+
+
+            // 3. Cria o Livro (Workbook) e adiciona a planilha
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "Abastecimentos");
+
+            // 4. Salva o arquivo no formato XLSX
+            const fileName = `abastecimentos_exportados_${new Date().toISOString().slice(0, 10)}.xlsx`;
+            XLSX.writeFile(wb, fileName);
+            
+            displayMessage('Dados de abastecimento exportados com sucesso para XLSX!', 'success');
+        }
+        
+        // Adiciona listeners para cálculo automático e inicialização DOM
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('liters').addEventListener('input', updateTotalValue);
+            document.getElementById('date').addEventListener('change', updateTotalValue);
+            document.getElementById('price-per-liter-display').textContent = `R$ ${PRICE_PER_LITER.toFixed(2).replace('.', ',')}`;
+
+            // Inicializa o Firebase e a autenticação primeiro
+            initFirebase().then(() => {
+                 // Depois que a autenticação está resolvida, configura o canvas e a UI
+                 setupSignatureCanvas(); 
+                 showRegisterView(); 
+            });
+
+            document.getElementById('show-register-btn').addEventListener('click', window.showRegisterView);
+            document.getElementById('show-admin-btn').addEventListener('click', window.showAdminView);
+            
+            // Define o botão inicial como ativo
+            document.getElementById('show-register-btn').classList.add('bg-cianoblue-700', 'text-white');
+            document.getElementById('show-register-btn').classList.remove('text-cianoblue-600', 'bg-cianoblue-50');
+        });
+
+    </script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .tab-button {
+            transition: all 0.3s ease;
+            white-space: nowrap;
+        }
+        .tab-button:not(.bg-cianoblue-700):hover {
+            background-color: #E0F2FE; /* cianoblue-100 */
+            color: #06B6D4; /* cianoblue-600 */
+        }
+        #signature-canvas {
+            touch-action: none; 
+            background-color: #ffffff;
+            border: 1px solid #D1D5DB; 
+            border-radius: 0.5rem;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+    <div id="message-container"></div>
+    
+    <!-- Header/Navegação -->
+    <header class="bg-white shadow-md sticky top-0 z-10">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex justify-between items-center flex-wrap">
+            <h1 class="text-xl sm:text-2xl font-extrabold text-cianoblue-600 mb-2 sm:mb-0">
+                <i class="fas fa-gas-pump mr-2"></i>Gestão de Abastecimento
+            </h1>
+            <div class="flex space-x-2">
+                <button id="show-register-btn" class="tab-button flex items-center px-3 py-2 sm:px-4 sm:py-2 rounded-lg text-xs sm:text-sm font-semibold">
+                    <i class="fas fa-file-alt mr-2"></i> Registrar
+                </button>
+                <button id="show-admin-btn" class="tab-button flex items-center px-3 py-2 sm:px-4 sm:py-2 rounded-lg text-xs sm:text-sm font-semibold text-cianoblue-600 bg-cianoblue-50">
+                    <i class="fas fa-cogs mr-2"></i> Administrativo
+                </button>
+            </div>
+            <!-- Exibição do UID (Apenas para debug e referência, como solicitado) -->
+            <p class="w-full text-xs text-right text-gray-500 mt-1 truncate">
+                <i class="fas fa-user-circle mr-1"></i> ID Usuário: <span id="debug-auth-id">Carregando...</span>
+            </p>
+        </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        
+        <!-- Tela de Registro de Abastecimento -->
+        <section id="register-view" class="hidden">
+            <h2 class="text-2xl sm:text-3xl font-bold text-gray-800 mb-6 border-b pb-2">Novo Registro de Abastecimento</h2>
+            
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <form id="supply-form" onsubmit="handleSaveSupply(event)">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        
+                        <!-- Coluna 1: Dados Principais -->
+                        <div class="space-y-4">
+                            <div>
+                                <label for="date" class="block text-sm font-medium text-gray-700">Data do Abastecimento <span class="text-red-500">*</span></label>
+                                <input type="date" id="date" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-cianoblue-500 focus:ring-cianoblue-500 p-2.5 border">
+                            </div>
+                            <div>
+                                <label for="day-of-week" class="block text-sm font-medium text-gray-700">Dia da Semana</label>
+                                <input type="text" id="day-of-week" disabled class="mt-1 block w-full rounded-md border-gray-300 bg-gray-100 p-2.5 border cursor-not-allowed text-gray-600">
+                            </div>
+                            <div>
+                                <label for="plate" class="block text-sm font-medium text-gray-700">Placa do Veículo <span class="text-red-500">*</span></label>
+                                <input type="text" id="plate" required maxlength="7" pattern="[A-Z0-9]+" title="Apenas letras maiúsculas e números" placeholder="Ex: ABC1234" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-cianoblue-500 focus:ring-cianoblue-500 p-2.5 border uppercase">
+                            </div>
+                            <div>
+                                <label for="mileage" class="block text-sm font-medium text-gray-700">Quilometragem (KM) <span class="text-red-500">*</span></label>
+                                <input type="number" id="mileage" required min="1" placeholder="Ex: 55000" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-cianoblue-500 focus:ring-cianoblue-500 p-2.5 border">
+                            </div>
+                        </div>
+
+                        <!-- Coluna 2: Pessoas e Litros -->
+                        <div class="space-y-4">
+                            <div>
+                                <label for="driver" class="block text-sm font-medium text-gray-700">Motorista/Proprietário <span class="text-red-500">*</span></label>
+                                <input type="text" id="driver" required placeholder="Nome do motorista" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-cianoblue-500 focus:ring-cianoblue-500 p-2.5 border">
+                            </div>
+                            <div>
+                                <label for="attendant" class="block text-sm font-medium text-gray-700">Responsável pelo Abastecimento <span class="text-red-500">*</span></label>
+                                <input type="text" id="attendant" required placeholder="Nome do responsável" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-cianoblue-500 focus:ring-cianoblue-500 p-2.5 border">
+                            </div>
+                            <div>
+                                <label for="liters" class="block text-sm font-medium text-gray-700">Quantidade de Litros <span class="text-red-500">*</span></label>
+                                <input type="number" step="0.01" id="liters" required min="0.01" placeholder="Ex: 50.5" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-cianoblue-500 focus:ring-cianoblue-500 p-2.5 border">
+                            </div>
+                            
+                            <!-- Valores Fixos/Calculados -->
+                            <div class="bg-cianoblue-50 p-4 rounded-lg shadow-inner">
+                                <p class="text-sm font-medium text-gray-700">Valor do Litro (Fixo):</p>
+                                <p id="price-per-liter-display" class="text-xl font-bold text-teal-600">R$ 6,15</p>
+                                
+                                <div class="mt-3 pt-3 border-t border-cianoblue-200">
+                                    <p class="text-sm font-medium text-gray-700">Valor Total (Qtd. * R$ 6,15):</p>
+                                    <p id="total-value" class="text-3xl font-extrabold text-cianoblue-600">R$ 0,00</p>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Coluna 3: Assinatura (Prévia e Botão) -->
+                        <div class="space-y-4 md:col-span-1">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700">Assinatura do Motorista/Proprietário <span class="text-red-500">*</span></label>
+                                <div class="mt-1 flex flex-col items-center border border-gray-300 rounded-md p-3 bg-gray-50">
+                                    <img id="signature-preview" src="" alt="Prévia da Assinatura" class="w-full max-h-24 object-contain border border-dashed border-gray-400 rounded-md bg-white p-1" style="display: none;">
+                                    <p id="signature-status" class="text-sm text-red-500 mt-2">Nenhuma assinatura capturada.</p>
+                                    <button type="button" onclick="openSignatureModal()" class="mt-3 w-full py-2 px-4 border border-transparent rounded-lg text-sm font-medium text-white bg-cianoblue-600 hover:bg-cianoblue-700 transition duration-150">
+                                        <i class="fas fa-signature mr-2"></i> Abrir Assinatura
+                                    </button>
+                                </div>
+                            </div>
+
+                            <button type="submit" class="w-full flex justify-center py-3 px-4 border border-transparent rounded-lg shadow-md text-lg font-bold text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150">
+                                <i class="fas fa-check-circle mr-2"></i> Salvar e Visualizar Nota
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </section>
+
+        <!-- Tela Administrativa -->
+        <section id="admin-view" class="hidden">
+            <h2 class="text-xl sm:text-3xl font-bold text-gray-800 mb-6 border-b pb-2">Relatório Administrativo de Abastecimentos</h2>
+            
+            <div class="flex justify-between items-center mb-4 flex-wrap">
+                <p class="text-sm text-gray-600 mb-2 sm:mb-0">Total de Registros: <span id="total-records-count" class="font-bold text-cianoblue-600">0</span></p>
+                <button onclick="window.exportToXLSX()" class="flex items-center px-4 py-2 bg-cianoblue-600 text-white text-sm font-medium rounded-lg shadow-md hover:bg-cianoblue-700 transition duration-150">
+                    <i class="fas fa-file-excel mr-2"></i> Exportar XLSX (Excel)
+                </button>
+            </div>
+            
+            <div class="bg-white rounded-xl shadow-lg border border-gray-200 overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Data</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Placa</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">KM</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Motorista</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Responsável</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Litros</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total</th>
+                            <th class="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Assinatura</th>
+                        </tr>
+                    </thead>
+                    <tbody id="admin-table-body" class="bg-white divide-y divide-gray-200">
+                        <!-- Mensagem de carregamento inicial -->
+                        <tr><td colspan="8" class="p-4 text-center text-gray-500">Aguardando autenticação e carregamento de dados...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+    </main>
+    
+    <!-- Modal de Nota Pop-up -->
+    <div id="receipt-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4" onclick="closeReceiptModal()">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden transform transition-all" onclick="event.stopPropagation()">
+            <div class="p-6 bg-cianoblue-600 text-white flex justify-between items-center">
+                <h3 class="text-xl font-bold">Confirmação de Abastecimento</h3>
+                <button onclick="closeReceiptModal()" class="text-white hover:text-cianoblue-100 transition"><i class="fas fa-times"></i></button>
+            </div>
+            <div id="receipt-content" class="p-4">
+                <!-- Conteúdo da nota será inserido aqui -->
+                <p>Gerando nota...</p>
+            </div>
+            <div class="p-4 border-t flex justify-end">
+                <button id="confirm-save-btn" class="flex items-center py-2 px-4 border border-transparent rounded-lg shadow-md text-sm font-bold text-white bg-teal-600 hover:bg-teal-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-teal-500 transition duration-150">
+                    <i class="fas fa-save mr-2"></i> Salvar no Administrativo
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Assinatura -->
+    <div id="signature-modal" class="hidden fixed inset-0 bg-black bg-opacity-70 z-50 flex items-center justify-center p-4" onclick="closeSignatureModal()">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden transform transition-all" onclick="event.stopPropagation()">
+            <!-- Header -->
+            <div class="p-4 bg-cianoblue-600 text-white flex justify-between items-center">
+                <h3 class="text-lg font-bold">Assinatura Digital</h3>
+                <button onclick="closeSignatureModal()" class="text-white hover:text-cianoblue-100 transition"><i class="fas fa-times"></i></button>
+            </div>
+            <!-- Body: Canvas -->
+            <div class="p-4">
+                <canvas id="signature-canvas" class="w-full h-48 bg-white rounded-md border border-gray-300 shadow-inner"></canvas>
+                <p class="text-xs text-gray-500 mt-2 text-center">Assine na área acima utilizando o mouse ou toque. A assinatura substitui o Base64 anterior.</p>
+            </div>
+            <!-- Footer: Actions -->
+            <div class="p-4 border-t flex justify-between items-center">
+                <button type="button" id="clear-signature-btn" class="py-2 px-4 border border-red-300 text-sm font-medium rounded-lg text-red-700 bg-red-100 hover:bg-red-200 transition duration-150">
+                    <i class="fas fa-undo mr-1"></i> Limpar
+                </button>
+                <button type="button" id="save-signature-btn" class="flex items-center py-2 px-4 rounded-lg shadow-md text-sm font-bold text-white bg-teal-600 hover:bg-teal-700 transition duration-150">
+                    <i class="fas fa-save mr-2"></i> Salvar Assinatura
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal para Visualizar Assinatura (Admin) -->
+    <div id="signature-display-modal" class="hidden fixed inset-0 bg-black bg-opacity-70 z-50 flex items-center justify-center p-4" onclick="closeSignatureDisplayModal()">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden transform transition-all" onclick="event.stopPropagation()">
+            <div class="p-4 bg-teal-600 text-white flex justify-between items-center">
+                <h3 class="text-lg font-bold">Assinatura Registrada</h3>
+                <button onclick="closeSignatureDisplayModal()" class="text-white hover:text-teal-100 transition"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="p-6 text-center">
+                <img id="display-signature-image" src="" alt="Assinatura do Registro" class="w-full h-auto border border-gray-400 rounded-md bg-white p-2"/>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
